@@ -3,7 +3,8 @@ use std::net::SocketAddr;
 use futures_util::{SinkExt, StreamExt};
 use log::*;
 use tokio::net::{TcpListener, TcpStream};
-use tokio_tungstenite::{accept_async, tungstenite::Error as WsError};
+use tokio_tungstenite::accept_async;
+use tungstenite::Error as WsError;
 
 #[tokio::main]
 async fn main() {
