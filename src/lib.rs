@@ -11,9 +11,9 @@ use mediasoup::{
     worker::{WorkerLogLevel, WorkerLogTag},
 };
 use serde::{Deserialize, Serialize};
-use tokio::net::TcpStream;
+use tokio::{net::TcpStream, sync::mpsc::unbounded_channel};
 use tokio_tungstenite::accept_async;
-use tungstenite::{Error as WsError, Result as WsResult};
+use tungstenite::protocol::Message;
 
 /// List of codecs that SFU will accept from clients.
 fn media_codecs() -> Vec<RtpCodecCapability> {
@@ -128,7 +128,16 @@ struct Transports {
     producer: WebRtcTransport,
 }
 
-struct AppState {
+#[derive(Debug)]
+enum InternalMessage {
+    /// Save producer in connection-specific vec to prevent it from being destroyed.
+    SaveProducer(Producer),
+    /// Save consumer in connection-specific hashmap to prevent it from being destroyed.
+    SaveConsumer(Consumer),
+    WebsocketMessage(Message),
+}
+
+pub struct AppState {
     /// RTP capabilities received from the client.
     client_rtp_capabilities: Option<RtpCapabilities>,
 
@@ -147,7 +156,7 @@ struct AppState {
 
 impl AppState {
     /// Create a new instance representing WebSocket connection.
-    async fn new(worker_manager: &WorkerManager) -> Result<Self, String> {
+    pub async fn new(worker_manager: &WorkerManager) -> Result<Self, String> {
         let mut settings = WorkerSettings::default();
         settings.log_level = WorkerLogLevel::Debug;
         settings.log_tags = vec![
@@ -206,30 +215,52 @@ impl AppState {
             },
         })
     }
-}
 
-pub async fn accept_connection(peer: SocketAddr, stream: TcpStream) {
-    if let Err(error) = handle_connection(peer, stream).await {
-        match error {
-            WsError::ConnectionClosed | WsError::Protocol(_) | WsError::Utf8 => (),
-            err => eprintln!("Error processing connection: {}", err),
+    fn save_producer_or_consumer(&mut self, message: InternalMessage) {
+        match message {
+            InternalMessage::SaveProducer(producer) => {
+                self.producers.push(producer);
+            }
+            InternalMessage::SaveConsumer(consumer) => {
+                self.consumers.insert(consumer.id(), consumer);
+            }
+            _ => (),
         }
     }
 }
 
-async fn handle_connection(peer: SocketAddr, stream: TcpStream) -> WsResult<()> {
-    let mut ws_stream = accept_async(stream).await.expect("Failed to accept");
+pub async fn handle_connection(
+    peer: SocketAddr,
+    stream: TcpStream,
+    worker_manager: Arc<WorkerManager>,
+) {
+    let ws_stream = accept_async(stream).await.expect("Failed to accept");
     println!("New WebSocket connection: {}", peer);
 
-    let (outgoing, incoming) = ws_stream.split();
+    let mut state = AppState::new(&worker_manager)
+        .await
+        .expect("Could not create app state.");
 
-    Ok(())
-}
+    let (mut sender, mut receiver) = ws_stream.split();
 
-async fn websocket(stream: WebSocket, mut state: AppState) {
-    println!("WebSocket connection created");
+    let (tx, mut rx) = unbounded_channel();
 
-    let (mut sender, mut receiver) = stream.split();
+    tokio::task::spawn_local(async move {
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                InternalMessage::WebsocketMessage(msg) => {
+                    sender.send(msg).await.unwrap();
+                }
+                // InternalMessage::SaveProducer(producer) => {
+                //     // state.producers.push(producer);
+                // }
+                // InternalMessage::SaveConsumer(consumer) => {
+                //     // state.consumers.insert(consumer.id(), consumer);
+                // }
+                _ => state.save_producer_or_consumer(msg),
+            }
+        }
+    });
 
     // We know that both consumer and producer transports will be used, so we sent server
     // information about both in an initialization message alongside with router capabilities
@@ -251,7 +282,9 @@ async fn websocket(stream: WebSocket, mut state: AppState) {
     };
 
     let msg = serde_json::to_string(&server_init_message).unwrap();
-    sender.send(Message::Text(msg)).await.unwrap();
+    // sender.send(Message::Text(msg)).await.unwrap();
+    tx.send(InternalMessage::WebsocketMessage(Message::Text(msg)))
+        .unwrap();
 
     while let Some(Ok(Message::Text(message))) = receiver.next().await {
         let msg = serde_json::from_str::<ClientMessage>(&message).unwrap();
@@ -267,21 +300,26 @@ async fn websocket(stream: WebSocket, mut state: AppState) {
                 // Establish connection for producer transport using DTLS parameters received
                 // from the client, but doing so in a background task since this handler is
                 // synchronous.
-                match transport
-                    .connect(WebRtcTransportRemoteParameters { dtls_parameters })
-                    .await
-                {
-                    Ok(_) => {
-                        let msg = serde_json::to_string(&ServerMessage::ConnectedProducerTransport)
-                            .unwrap();
-                        sender.send(Message::Text(msg)).await.unwrap();
-                        println!("Producer transport connected");
+                let tx = tx.clone();
+                tokio::task::spawn_local(async move {
+                    match transport
+                        .connect(WebRtcTransportRemoteParameters { dtls_parameters })
+                        .await
+                    {
+                        Ok(_) => {
+                            let msg =
+                                serde_json::to_string(&ServerMessage::ConnectedProducerTransport)
+                                    .unwrap();
+                            // sender.send(Message::Text(msg)).await.unwrap();
+                            tx.send(InternalMessage::WebsocketMessage(Message::Text(msg)))
+                                .unwrap();
+                            println!("Producer transport connected");
+                        }
+                        Err(error) => {
+                            eprintln!("Failed to connect producer transport: {}", error);
+                        }
                     }
-                    Err(error) => {
-                        eprintln!("Failed to connect producer transport: {}", error);
-                        return;
-                    }
-                }
+                });
             }
             ClientMessage::Produce {
                 kind,
@@ -291,46 +329,59 @@ async fn websocket(stream: WebSocket, mut state: AppState) {
 
                 // Use producer transport to create a new producer on the server with given RTP
                 // parameters.
-                match transport
-                    .produce(ProducerOptions::new(kind, rtp_parameters))
-                    .await
-                {
-                    Ok(producer) => {
-                        let id = producer.id();
-                        let msg = serde_json::to_string(&ServerMessage::Produced { id }).unwrap();
-                        sender.send(Message::Text(msg)).await.unwrap();
+                let tx = tx.clone();
+                tokio::task::spawn_local(async move {
+                    match transport
+                        .produce(ProducerOptions::new(kind, rtp_parameters))
+                        .await
+                    {
+                        Ok(producer) => {
+                            let id = producer.id();
+                            let msg =
+                                serde_json::to_string(&ServerMessage::Produced { id }).unwrap();
+                            // sender.send(Message::Text(msg)).await.unwrap();
+                            tx.send(InternalMessage::WebsocketMessage(Message::Text(msg)))
+                                .unwrap();
 
-                        // Retain producer to prevent it from being destroyed.
-                        state.producers.push(producer);
+                            // Retain producer to prevent it from being destroyed.
+                            // Producer is stored in a vec since if we don't do it, it will get
+                            // destroyed as soon as its instance goes out out scope
+                            // state.producers.push(producer);
+                            tx.send(InternalMessage::SaveProducer(producer)).unwrap();
 
-                        println!("{:?} producer created: {}", kind, id);
+                            println!("{:?} producer created: {}", kind, id);
+                        }
+                        Err(error) => {
+                            eprintln!("Failed to create {:?} producer: {}", kind, error);
+                        }
                     }
-                    Err(error) => {
-                        eprintln!("Failed to create {:?} producer: {}", kind, error);
-                        return;
-                    }
-                }
+                });
             }
             ClientMessage::ConnectConsumerTransport { dtls_parameters } => {
                 let transport = state.transports.consumer.clone();
 
                 // The same as producer transport, but for consumer transport.
-                match transport
-                    .connect(WebRtcTransportRemoteParameters { dtls_parameters })
-                    .await
-                {
-                    Ok(_) => {
-                        let msg = serde_json::to_string(&ServerMessage::ConnectedConsumerTransport)
-                            .unwrap();
-                        sender.send(Message::Text(msg)).await.unwrap();
+                let tx = tx.clone();
+                tokio::task::spawn_local(async move {
+                    match transport
+                        .connect(WebRtcTransportRemoteParameters { dtls_parameters })
+                        .await
+                    {
+                        Ok(_) => {
+                            let msg =
+                                serde_json::to_string(&ServerMessage::ConnectedConsumerTransport)
+                                    .unwrap();
+                            // sender.send(Message::Text(msg)).await.unwrap();
+                            tx.send(InternalMessage::WebsocketMessage(Message::Text(msg)))
+                                .unwrap();
 
-                        println!("Consumer transport connected");
+                            println!("Consumer transport connected");
+                        }
+                        Err(error) => {
+                            eprintln!("Failed to connect consumer transport: {}", error);
+                        }
                     }
-                    Err(error) => {
-                        eprintln!("Failed to connect consumer transport: {}", error);
-                        return;
-                    }
-                }
+                });
             }
             ClientMessage::Consume { producer_id } => {
                 let transport = state.transports.consumer.clone();
@@ -347,32 +398,36 @@ async fn websocket(stream: WebSocket, mut state: AppState) {
                 let mut options = ConsumerOptions::new(producer_id, rtp_capabilities);
                 options.paused = true;
 
-                match transport.consume(options).await {
-                    Ok(consumer) => {
-                        let id = consumer.id();
-                        let kind = consumer.kind();
-                        let rtp_parameters = consumer.rtp_parameters().clone();
+                let tx = tx.clone();
+                tokio::task::spawn_local(async move {
+                    match transport.consume(options).await {
+                        Ok(consumer) => {
+                            let id = consumer.id();
+                            let kind = consumer.kind();
+                            let rtp_parameters = consumer.rtp_parameters().clone();
 
-                        let msg = serde_json::to_string(&ServerMessage::Consumed {
-                            id,
-                            producer_id,
-                            kind,
-                            rtp_parameters,
-                        })
-                        .unwrap();
-                        sender.send(Message::Text(msg)).await.unwrap();
+                            let msg = serde_json::to_string(&ServerMessage::Consumed {
+                                id,
+                                producer_id,
+                                kind,
+                                rtp_parameters,
+                            })
+                            .unwrap();
+                            // sender.send(Message::Text(msg)).await.unwrap();
+                            tx.send(InternalMessage::WebsocketMessage(Message::Text(msg)))
+                                .unwrap();
 
-                        state.consumers.insert(consumer.id(), consumer);
+                            // state.consumers.insert(consumer.id(), consumer);
+                        }
+                        Err(error) => {
+                            eprintln!("Failed to create consumer: {}", error);
+                        }
                     }
-                    Err(error) => {
-                        eprintln!("Failed to create consumer: {}", error);
-                        return;
-                    }
-                }
+                });
             }
             ClientMessage::ConsumerResume { id } => {
                 if let Some(consumer) = state.consumers.get(&id).cloned() {
-                    tokio::spawn(async move {
+                    tokio::task::spawn(async move {
                         match consumer.resume().await {
                             Ok(_) => {
                                 println!(
