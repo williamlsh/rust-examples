@@ -1,0 +1,13 @@
+[package]
+name = "rust-examples"
+edition = "2021"
+version = "0.1.0"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+futures-channel = "0.3.18"
+futures-util = "0.3"
+tokio = {version = "1.14", features = ["full"]}
+tokio-tungstenite = "0.16"
+tungstenite = "0.16"
