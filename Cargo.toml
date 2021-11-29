@@ -1,0 +1,25 @@
+[package]
+name = "videoroom"
+edition = "2021"
+version = "0.1.0"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+actix = "0.12.0"
+actix-web-actors = "4.0.0-beta.7"
+futures-util = "0.3"
+mediasoup = "0.9"
+serde = {version = "1", features = ["derive"]}
+serde_json = "1"
+env_logger = "0.9.0"
+log = "0.4.14"
+event-listener-primitives = "2.0.1"
+parking_lot = "0.11.2"
+uuid = "0.8.2"
+async-lock = "2.4.0"
+futures-lite = "1.12.0"
+
+[dependencies.actix-web]
+default-features = false
+version = "4.0.0-beta.12"
