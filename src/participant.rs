@@ -45,7 +45,12 @@ pub struct ParticipantConnection {
     /// Room to which the client belongs
     room: Room,
     /// Event handlers that were attached and need to be removed when participant connection is
-    /// destroyed
+    /// destroyed.
+    ///
+    /// One participant connection has two handler callbacks, `producer_add` and `producer_remove`.
+    ///
+    /// They are in fact closures capturing their own ctxs (using their own connections to send messages) to implement broadcasting mechanism
+    /// instead of using channels fan in/out.
     attached_handlers: Vec<HandlerId>,
 }
 
@@ -129,6 +134,7 @@ impl Actor for ParticipantConnection {
             let address = address.clone();
 
             move |participant_id, producer| {
+                // Don't send to itself.
                 if &own_participant_id == participant_id {
                     return;
                 }
@@ -145,6 +151,7 @@ impl Actor for ParticipantConnection {
             let address = address.clone();
 
             move |participant_id, producer_id| {
+                // Don't send to itself.
                 if &own_participant_id == participant_id {
                     return;
                 }

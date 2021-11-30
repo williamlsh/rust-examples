@@ -123,6 +123,8 @@ impl Room {
 
     /// Add producer to the room, this will trigger notifications to other participants that
     /// will be able to consume it.
+    ///
+    /// One participant has two producers, video and audio producers.
     pub fn add_producer(&self, participant_id: ParticipantId, producer: Producer) {
         self.inner
             .clients
@@ -131,6 +133,7 @@ impl Room {
             .or_default()
             .push(producer.clone());
 
+        // Call all registered callback handlers to notify new producer.
         self.inner
             .handlers
             .producer_add
@@ -141,6 +144,7 @@ impl Room {
     pub fn remove_participant(&self, participant_id: &ParticipantId) {
         let producers = self.inner.clients.lock().remove(participant_id);
 
+        // Call all registered callback handlers.
         for producer in producers.unwrap_or_default() {
             let producer_id = &producer.id();
             self.inner
