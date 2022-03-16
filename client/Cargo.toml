@@ -1,0 +1,15 @@
+[package]
+name = "client"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+env_logger = "0.9"
+futures = "0.3"
+futures-timer = "3.0.2"
+libp2p = "0.43"
+libp2p-dcutr = "0.1"
+log = "0.4"
+structopt = "0.3"
